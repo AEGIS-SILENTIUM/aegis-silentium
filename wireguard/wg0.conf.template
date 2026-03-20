@@ -1,0 +1,64 @@
+# AEGIS-SILENTIUM WireGuard Configuration Template
+# ════════════════════════════════════════════════════════════════════════════
+# This WireGuard VPN provides the authenticated, encrypted channel between
+# relays and the Intelligence Core.  All relay→core communication MUST
+# traverse this interface.  Direct internet access to the core is blocked
+# by firewall rules (see scripts/setup_wireguard.sh).
+#
+# Each relay gets a unique /32 address in the 10.99.0.0/24 subnet.
+# The core sits at 10.99.0.1.
+#
+# Generate keys: wg genkey | tee private.key | wg pubkey > public.key
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── Core (Intelligence Core) configuration ───────────────────────────────────
+# File: /etc/wireguard/wg0.conf  on the CORE server
+[Interface]
+Address    = 10.99.0.1/24
+ListenPort = 51820
+PrivateKey = CORE_PRIVATE_KEY_PLACEHOLDER
+
+# PostUp: block direct internet access to core API port (only accept from wg0)
+PostUp   = iptables -A INPUT -p tcp --dport 5000 -i eth0 -j DROP
+PostDown = iptables -D INPUT -p tcp --dport 5000 -i eth0 -j DROP
+
+# ── Relay 1 peer ─────────────────────────────────────────────────────────────
+[Peer]
+# Relay 1
+PublicKey  = RELAY1_PUBLIC_KEY_PLACEHOLDER
+AllowedIPs = 10.99.0.2/32
+
+# ── Relay 2 peer ─────────────────────────────────────────────────────────────
+[Peer]
+# Relay 2
+PublicKey  = RELAY2_PUBLIC_KEY_PLACEHOLDER
+AllowedIPs = 10.99.0.3/32
+
+# ── Relay 3 peer (optional) ───────────────────────────────────────────────────
+[Peer]
+# Relay 3 (add as needed)
+PublicKey  = RELAY3_PUBLIC_KEY_PLACEHOLDER
+AllowedIPs = 10.99.0.4/32
+
+# ── Command Node peer (optional) ─────────────────────────────────────────────
+[Peer]
+# Command node — offline most of the time
+PublicKey            = CMDNODE_PUBLIC_KEY_PLACEHOLDER
+AllowedIPs           = 10.99.0.100/32
+PersistentKeepalive  = 0   # no keepalive — command node connects on demand
+
+# ════════════════════════════════════════════════════════════════════════════
+# Relay configuration (one per relay)
+# File: /etc/wireguard/wg0.conf  on RELAY-1
+# ════════════════════════════════════════════════════════════════════════════
+
+# [Interface]
+# Address    = 10.99.0.2/24
+# PrivateKey = RELAY1_PRIVATE_KEY_PLACEHOLDER
+#
+# [Peer]
+# # Intelligence Core
+# PublicKey           = CORE_PUBLIC_KEY_PLACEHOLDER
+# Endpoint            = CORE_PUBLIC_IP:51820
+# AllowedIPs          = 10.99.0.1/32
+# PersistentKeepalive = 25

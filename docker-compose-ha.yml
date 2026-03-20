@@ -1,0 +1,529 @@
+version: "3.9"
+
+# ════════════════════════════════════════════════════════════════════════
+# AEGIS-SILENTIUM v10 — High-Availability Stack
+# ════════════════════════════════════════════════════════════════════════
+#
+# Topology:
+#   postgres-primary + postgres-replica   — streaming replication
+#   redis-master + redis-sentinel×3       — Redis HA with auto-failover
+#   c2 ×2                                 — Active/active behind internal LB
+#   dashboard, scheduler, nodes           — as before
+#   prometheus + alertmanager             — metrics + alerting
+#   grafana                               — dashboards
+#
+# Network segmentation:
+#   aegis-data      — DB + Redis only (c2 can reach)
+#   aegis-internal  — C2, dashboard, scheduler, nodes
+#   aegis-monitor   — Prometheus, Grafana, Alertmanager
+#   aegis-mgmt      — pgAdmin, Redis Commander (admin profile only)
+#
+# Quick start:
+#   export OPERATOR_KEY=$(openssl rand -hex 16)
+#   export POSTGRES_PASSWORD=$(openssl rand -hex 16)
+#   export REDIS_PASSWORD=$(openssl rand -hex 16)
+#   export C2_JWT_SECRET=$(openssl rand -hex 32)
+#   docker compose up -d
+#   docker compose --profile monitoring up -d    # for metrics
+#   docker compose --profile admin up -d         # for admin UIs
+# ════════════════════════════════════════════════════════════════════════
+
+x-common-env: &common-env
+  OPERATOR_KEY:      ${OPERATOR_KEY:?Set OPERATOR_KEY}
+  C2_JWT_SECRET:     ${C2_JWT_SECRET:?Set C2_JWT_SECRET}
+  REDIS_HOST:        redis-master
+  REDIS_SENTINEL_HOSTS: "redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379"
+  REDIS_SENTINEL_MASTER: aegis-master
+  REDIS_PASSWORD:    ${REDIS_PASSWORD:-}
+  POSTGRES_HOST:     postgres-primary
+  POSTGRES_DB:       aegis
+  POSTGRES_USER:     aegis
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+  LOG_FORMAT:        json
+  LOG_LEVEL:         ${LOG_LEVEL:-INFO}
+
+x-node-env: &node-env
+  <<: *common-env
+  C2_URL:       http://c2-1:5000
+  REPORTS_DIR:  /reports
+  HB_INTERVAL:  "30"
+  TASK_INTERVAL: "5"
+  MAX_PARALLEL: "2"
+  SCAN_THREADS: "40"
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "10"
+
+x-healthcheck-pg: &hc-pg
+  test: ["CMD-SHELL", "pg_isready -U aegis -d aegis"]
+  interval: 10s
+  timeout: 5s
+  retries: 10
+  start_period: 20s
+
+x-healthcheck-redis: &hc-redis
+  test: ["CMD", "redis-cli", "ping"]
+  interval: 10s
+  timeout: 3s
+  retries: 10
+
+x-healthcheck-c2: &hc-c2
+  test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
+  interval: 15s
+  timeout: 5s
+  retries: 10
+  start_period: 30s
+
+# ── Networks ──────────────────────────────────────────────────────────
+networks:
+  aegis-data:
+    driver: bridge
+    internal: true    # no outbound internet — DB + Redis
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+
+  aegis-internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24
+
+  aegis-monitor:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.3.0/24
+
+  aegis-mgmt:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.4.0/24
+
+# ── Volumes ───────────────────────────────────────────────────────────
+volumes:
+  postgres-primary-data:
+  postgres-replica-data:
+  redis-master-data:
+  redis-sentinel-1-data:
+  redis-sentinel-2-data:
+  redis-sentinel-3-data:
+  reports-data:
+  aegis-logs:
+  prometheus-data:
+  grafana-data:
+
+# ════════════════════════════════════════════════════════════════════════
+# SERVICES
+# ════════════════════════════════════════════════════════════════════════
+services:
+
+  # ── PostgreSQL Primary ──────────────────────────────────────────────
+  postgres-primary:
+    image: postgres:16-alpine
+    container_name: aegis-pg-primary
+    <<: [*restart, *logging]
+    environment:
+      POSTGRES_DB:              aegis
+      POSTGRES_USER:            aegis
+      POSTGRES_PASSWORD:        ${POSTGRES_PASSWORD}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASS: ${PG_REPLICA_PASSWORD:-replicasecret}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-primary-data:/var/lib/postgresql/data
+      - ./deployment/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./deployment/migrations/v9_schema.sql:/docker-entrypoint-initdb.d/02_v9.sql:ro
+      - ./deployment/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      - aegis-data
+    healthcheck: *hc-pg
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=3
+        -c max_replication_slots=3
+        -c hot_standby=on
+        -c max_connections=200
+        -c shared_buffers=512MB
+        -c effective_cache_size=1536MB
+        -c work_mem=8MB
+        -c maintenance_work_mem=128MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=32MB
+        -c default_statistics_target=100
+        -c log_min_duration_statement=500
+        -c log_checkpoints=on
+        -c log_connections=off
+        -c log_disconnections=off
+        -c log_lock_waits=on
+        -c deadlock_timeout=1s
+        -c statement_timeout=30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2"
+
+  # ── PostgreSQL Streaming Replica ────────────────────────────────────
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: aegis-pg-replica
+    profiles: ["ha"]
+    <<: [*restart, *logging]
+    environment:
+      PGDATA:                   /var/lib/postgresql/data/pgdata
+      POSTGRES_PRIMARY_HOST:    postgres-primary
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASS: ${PG_REPLICA_PASSWORD:-replicasecret}
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+    networks:
+      - aegis-data
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    entrypoint: |
+      sh -c '
+        until pg_basebackup -h postgres-primary -U replicator -D "$PGDATA" -Fp -Xs -P -R; do
+          echo "Waiting for primary..."; sleep 3
+        done
+        postgres
+      '
+
+  # ── Redis Master ────────────────────────────────────────────────────
+  redis-master:
+    image: redis:7-alpine
+    container_name: aegis-redis-master
+    <<: [*restart, *logging]
+    volumes:
+      - redis-master-data:/data
+    networks:
+      - aegis-data
+      - aegis-internal    # C2 needs direct access
+    healthcheck: *hc-redis
+    command: >
+      redis-server
+        --maxmemory 1gb
+        --maxmemory-policy allkeys-lru
+        --save 300 10
+        --save 60 1000
+        --loglevel notice
+        ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: "1"
+
+  # ── Redis Sentinels (HA) ────────────────────────────────────────────
+  redis-sentinel-1:
+    image: redis:7-alpine
+    container_name: aegis-redis-sentinel-1
+    profiles: ["ha"]
+    <<: [*restart, *logging]
+    volumes:
+      - redis-sentinel-1-data:/data
+      - ./deployment/redis-sentinel.conf:/etc/redis/sentinel.conf:ro
+    networks:
+      - aegis-data
+      - aegis-internal
+    command: redis-sentinel /etc/redis/sentinel.conf
+    depends_on:
+      - redis-master
+
+  redis-sentinel-2:
+    image: redis:7-alpine
+    container_name: aegis-redis-sentinel-2
+    profiles: ["ha"]
+    <<: [*restart, *logging]
+    volumes:
+      - redis-sentinel-2-data:/data
+      - ./deployment/redis-sentinel.conf:/etc/redis/sentinel.conf:ro
+    networks:
+      - aegis-data
+      - aegis-internal
+    command: redis-sentinel /etc/redis/sentinel.conf
+    depends_on:
+      - redis-master
+
+  redis-sentinel-3:
+    image: redis:7-alpine
+    container_name: aegis-redis-sentinel-3
+    profiles: ["ha"]
+    <<: [*restart, *logging]
+    volumes:
+      - redis-sentinel-3-data:/data
+      - ./deployment/redis-sentinel.conf:/etc/redis/sentinel.conf:ro
+    networks:
+      - aegis-data
+      - aegis-internal
+    command: redis-sentinel /etc/redis/sentinel.conf
+    depends_on:
+      - redis-master
+
+  # ── C2 Servers (active/active) ──────────────────────────────────────
+  c2-1:
+    build:
+      context: .
+      dockerfile: c2/Dockerfile
+    container_name: aegis-c2-1
+    <<: [*restart, *logging]
+    environment:
+      <<: *common-env
+      C2_INSTANCE_ID: c2-1
+      C2_BIND_PORT:   "5000"
+      MAX_RATE:       "200"
+    ports:
+      - "5000:5000"
+      - "5001:5001/udp"
+    networks:
+      - aegis-internal
+      - aegis-data       # needs to reach postgres + redis
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+    healthcheck: *hc-c2
+    volumes:
+      - aegis-logs:/logs
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2"
+        reservations:
+          memory: 512M
+
+  c2-2:
+    build:
+      context: .
+      dockerfile: c2/Dockerfile
+    container_name: aegis-c2-2
+    profiles: ["ha"]
+    <<: [*restart, *logging]
+    environment:
+      <<: *common-env
+      C2_INSTANCE_ID: c2-2
+      C2_BIND_PORT:   "5000"
+      MAX_RATE:       "200"
+    ports:
+      - "5002:5000"
+    networks:
+      - aegis-internal
+      - aegis-data
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+    healthcheck: *hc-c2
+    volumes:
+      - aegis-logs:/logs
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2"
+
+  # ── Dashboard ────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: aegis-dashboard
+    <<: [*restart, *logging]
+    environment:
+      <<: *common-env
+      C2_URL: http://c2-1:5000
+      PORT:   "7331"
+    ports:
+      - "7331:7331"
+    networks:
+      - aegis-internal
+    depends_on:
+      c2-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7331/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+  # ── Scheduler ────────────────────────────────────────────────────────
+  scheduler:
+    build:
+      context: .
+      dockerfile: scheduler/Dockerfile
+    container_name: aegis-scheduler
+    <<: [*restart, *logging]
+    environment:
+      <<: *common-env
+      RESCAN_INTERVAL_HOURS:   "24"
+      STALE_TASK_TIMEOUT_MIN:  "30"
+      DEAD_NODE_MINUTES:       "10"
+      SCHEDULER_CYCLE_SECONDS: "60"
+      RETAIN_EVENTS_DAYS:      "30"
+      RETAIN_AUDIT_DAYS:       "365"
+      RETAIN_WEBHOOKS_DAYS:    "14"
+    networks:
+      - aegis-internal
+      - aegis-data
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+  # ── Worker Nodes ─────────────────────────────────────────────────────
+  node-1:
+    build:
+      context: .
+      dockerfile: node/Dockerfile
+    container_name: aegis-node-1
+    <<: [*restart, *logging]
+    environment:
+      <<: *node-env
+      NODE_ID: node-1-${HOSTNAME:-docker}
+    networks:
+      - aegis-internal
+    depends_on:
+      c2-1:
+        condition: service_healthy
+    volumes:
+      - reports-data:/reports
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2"
+
+  node-2:
+    build:
+      context: .
+      dockerfile: node/Dockerfile
+    container_name: aegis-node-2
+    <<: [*restart, *logging]
+    environment:
+      <<: *node-env
+      NODE_ID: node-2-${HOSTNAME:-docker}
+    networks:
+      - aegis-internal
+    depends_on:
+      c2-1:
+        condition: service_healthy
+    volumes:
+      - reports-data:/reports
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2"
+
+  # ── Prometheus ────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: aegis-prometheus
+    profiles: ["monitoring"]
+    <<: [*restart, *logging]
+    volumes:
+      - prometheus-data:/prometheus
+      - ./deployment/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deployment/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    networks:
+      - aegis-monitor
+      - aegis-internal   # needs to scrape c2
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+      - --web.enable-admin-api
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: aegis-alertmanager
+    profiles: ["monitoring"]
+    <<: [*restart, *logging]
+    volumes:
+      - ./deployment/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks:
+      - aegis-monitor
+    ports:
+      - "9093:9093"
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: aegis-grafana
+    profiles: ["monitoring"]
+    <<: [*restart, *logging]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-aegis-grafana}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      GF_SERVER_ROOT_URL:         http://localhost:3000
+      GF_AUTH_ANONYMOUS_ENABLED:  "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deployment/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./deployment/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - aegis-monitor
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  # ── Admin tools (profile: admin) ─────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:8.5
+    container_name: aegis-pgadmin
+    profiles: ["admin"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    admin@aegis.local
+      PGADMIN_DEFAULT_PASSWORD: ${POSTGRES_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "5050:80"
+    networks:
+      - aegis-mgmt
+      - aegis-data
+    <<: *restart
+
+  redis-insight:
+    image: redis/redisinsight:2.44
+    container_name: aegis-redis-insight
+    profiles: ["admin"]
+    ports:
+      - "5540:5540"
+    networks:
+      - aegis-mgmt
+      - aegis-data
+    <<: *restart

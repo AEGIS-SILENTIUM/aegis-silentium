@@ -1,0 +1,38 @@
+# AEGIS-SILENTIUM Malleable C2 Profile — Default
+# Mimics standard REST API traffic (generic JSON service)
+# ──────────────────────────────────────────────────────────────────────────────
+# AUTHORIZED USE ONLY — professional adversary simulation environments.
+
+name: default-rest-api
+version: "1.0"
+
+# HTTP headers injected on every request/response to blend with normal traffic
+default_headers:
+  X-Request-Id: "auto"          # relay replaces "auto" with a random UUID
+  Cache-Control: "no-store"
+  X-Content-Type-Options: "nosniff"
+  X-Frame-Options: "DENY"
+  Referrer-Policy: "no-referrer"
+
+# URI patterns (relay picks the first as beacon endpoint, second as handshake)
+uris:
+  - /api/v1/events
+  - /api/v1/auth/token
+  - /api/v1/mesh
+  - /health
+
+# Client block: transformations applied by implant before sending
+client:
+  container: json         # wrap payload inside a JSON object
+  key: "events"           # JSON field name carrying the payload
+  transforms:
+    - op: gzip            # compress first to reduce size
+    - op: base64          # then base64-encode for JSON embedding
+
+# Server block: transformations applied by relay before sending response
+server:
+  container: json
+  key: "data"
+  transforms:
+    - op: gzip
+    - op: base64

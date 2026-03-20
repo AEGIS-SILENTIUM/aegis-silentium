@@ -1,0 +1,130 @@
+groups:
+  - name: aegis.availability
+    interval: 30s
+    rules:
+
+      - alert: C2Down
+        expr: up{job=~"aegis-c2.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          runbook:  runbooks/RB-001-c2-down.md
+        annotations:
+          summary:     "C2 server {{ $labels.instance }} is DOWN"
+          description: "The AEGIS C2 server has been unreachable for > 1 minute. SSE streams will be dropped and operators disconnected."
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 30s
+        labels:
+          severity: critical
+          runbook:  runbooks/RB-002-postgres-down.md
+        annotations:
+          summary:     "PostgreSQL is DOWN"
+          description: "All reads and writes are failing. The C2 will degrade to in-memory mode."
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: warning
+          runbook:  runbooks/RB-003-redis-down.md
+        annotations:
+          summary:     "Redis is DOWN"
+          description: "SSE pub/sub and presence tracking are degraded. C2 still functions via in-process SSE."
+
+  - name: aegis.performance
+    rules:
+
+      - alert: HighApiLatency
+        expr: |
+          histogram_quantile(0.95,
+            rate(aegis_http_request_duration_ms_bucket{path!~".*metrics.*"}[5m])
+          ) > 2000
+        for: 5m
+        labels:
+          severity: warning
+          runbook:  runbooks/RB-004-high-latency.md
+        annotations:
+          summary:     "P95 API latency > 2000ms"
+          description: "95th percentile request latency is {{ $value | humanize }}ms on {{ $labels.path }}"
+
+      - alert: HighErrorRate
+        expr: |
+          rate(aegis_http_requests_total{status=~"5.."}[5m]) /
+          rate(aegis_http_requests_total[5m]) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+          runbook:  runbooks/RB-004-high-latency.md
+        annotations:
+          summary:     "Error rate > 5%"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx errors"
+
+      - alert: DbPoolExhausted
+        expr: aegis_db_pool_wait > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DB connection pool has {{ $value }} waiters"
+
+  - name: aegis.security
+    rules:
+
+      - alert: AuthBruteForce
+        expr: |
+          rate(aegis_auth_attempts_total{result="fail"}[5m]) > 1
+        for: 2m
+        labels:
+          severity: critical
+          runbook:  runbooks/RB-005-auth-incident.md
+        annotations:
+          summary:     "Authentication brute-force detected"
+          description: "{{ $value | humanize }} failed auth attempts/sec over the last 5 minutes"
+
+      - alert: CircuitBreakerOpen
+        expr: aegis_circuit_breaker_trips_total > 0
+        for: 0m
+        labels:
+          severity: warning
+          runbook:  runbooks/RB-006-circuit-breaker.md
+        annotations:
+          summary:     "Circuit breaker TRIPPED: {{ $labels.service }}"
+          description: "Service '{{ $labels.service }}' circuit breaker has tripped. Calls are failing fast."
+
+      - alert: RateLimitingSpike
+        expr: rate(aegis_rate_limited_total[5m]) > 5
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "Elevated rate limiting: {{ $value | humanize }} req/s being limited"
+
+  - name: aegis.operations
+    rules:
+
+      - alert: NoActiveNodes
+        expr: aegis_active_nodes == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No active nodes — all beacons may be lost"
+
+      - alert: SseClientsDrop
+        expr: delta(aegis_sse_clients[5m]) < -5
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "SSE clients dropped by {{ $value | abs }} in 5 minutes"
+
+      - alert: WebhookDeliveryFailures
+        expr: |
+          rate(aegis_http_requests_total{path="/api/webhooks",status=~"5.."}[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook deliveries are failing"

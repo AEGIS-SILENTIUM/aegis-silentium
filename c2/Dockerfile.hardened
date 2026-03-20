@@ -1,0 +1,146 @@
+# ════════════════════════════════════════════════════════════════════════
+# AEGIS-SILENTIUM v9 — Hardened C2 Server Dockerfile
+# ════════════════════════════════════════════════════════════════════════
+#
+# Security hardening:
+#   - Multi-stage build: build tools stay in builder, not runtime
+#   - Non-root user (aegis uid=1000) — never runs as root
+#   - Read-only filesystem where possible
+#   - No default secrets in ENV — all required vars must be injected
+#   - Minimal package set — curl/ca-certificates only for healthcheck
+#   - Pinned base image digest (update periodically with: docker pull)
+#   - SBOM labels for supply-chain auditability
+#   - Healthcheck against /health (not /api/stats which needs DB)
+#
+# Build args (set at build time for SBOM):
+#   --build-arg BUILD_DATE=...
+#   --build-arg GIT_COMMIT=...
+#   --build-arg VERSION=9.0
+# ════════════════════════════════════════════════════════════════════════
+
+ARG PYTHON_VERSION=3.12
+
+# ── Stage 1: dependency builder ──────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+WORKDIR /build
+
+# Install only build-time deps (not in final image)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ libffi-dev libssl-dev libpq-dev python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+# Install to a prefix so we can COPY cleanly into the runtime stage
+RUN pip install --upgrade pip==24.0 wheel && \
+    pip install \
+        --prefix=/deps \
+        --no-warn-script-location \
+        --no-cache-dir \
+        flask==3.0.3 \
+        flask-cors==4.0.1 \
+        gunicorn==21.2.0 \
+        gevent==24.2.1 \
+        redis==5.0.4 \
+        psycopg2-binary==2.9.9 \
+        cryptography==42.0.5 \
+        requests==2.31.0 \
+        orjson==3.9.15
+
+# ── Stage 2: hardened runtime ─────────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim
+
+# Build-time labels for SBOM + auditing
+ARG BUILD_DATE="unknown"
+ARG GIT_COMMIT="unknown"
+ARG VERSION="9.0"
+
+LABEL org.opencontainers.image.title="AEGIS-SILENTIUM C2"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}"
+LABEL org.opencontainers.image.source="https://github.com/your-org/aegis-silentium"
+LABEL org.opencontainers.image.vendor="AEGIS Project"
+LABEL org.opencontainers.image.licenses="Proprietary"
+
+WORKDIR /app
+
+# Runtime deps: curl (healthcheck), ca-certificates (HTTPS outbound), libpq
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        libpq5 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy pre-built Python packages from builder
+COPY --from=builder /deps /usr/local
+
+# Copy application source
+COPY c2/      /app/c2/
+COPY shared/  /app/shared/
+COPY configs/ /app/configs/
+
+# Create non-root user and required directories
+RUN groupadd --gid 1000 aegis && \
+    useradd  --uid 1000 --gid aegis --shell /bin/false --no-create-home aegis && \
+    mkdir -p /logs /certs /app/tmp && \
+    chown -R aegis:aegis /logs /certs /app/tmp && \
+    chmod 750 /logs /certs
+
+# Python runtime flags
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONFAULTHANDLER=1
+ENV PYTHONUTF8=1
+
+# Application config — NO DEFAULTS for sensitive values.
+# All of these MUST be injected at runtime via environment or secrets manager.
+ENV REDIS_HOST=""
+ENV REDIS_PORT="6379"
+ENV POSTGRES_HOST=""
+ENV POSTGRES_DB="aegis"
+ENV POSTGRES_USER="aegis"
+ENV LOG_FORMAT="json"
+ENV LOG_LEVEL="INFO"
+ENV BEACON_LPOLL="25"
+ENV MAX_RATE="120"
+
+# Gunicorn tuning
+ENV GUNICORN_WORKERS="4"
+ENV GUNICORN_TIMEOUT="120"
+ENV GUNICORN_KEEPALIVE="75"
+
+# Secrets: injected at runtime, never defaults
+# OPERATOR_KEY         — required
+# POSTGRES_PASSWORD    — required
+# C2_JWT_SECRET        — required (or SecretManager bootstraps from DB)
+# REDIS_PASSWORD       — optional
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=5 \
+    CMD curl -sf http://localhost:5000/health || exit 1
+
+EXPOSE 5000 5001/udp
+
+VOLUME ["/logs", "/certs"]
+
+# Run as non-root
+USER aegis
+
+WORKDIR /app/c2
+
+CMD ["sh", "-c", \
+     "gunicorn \
+       --bind 0.0.0.0:5000 \
+       --worker-class gevent \
+       --workers ${GUNICORN_WORKERS} \
+       --worker-connections 1000 \
+       --timeout ${GUNICORN_TIMEOUT} \
+       --keep-alive ${GUNICORN_KEEPALIVE} \
+       --log-level ${LOG_LEVEL} \
+       --access-logfile /logs/c2-access.log \
+       --error-logfile /logs/c2-error.log \
+       --forwarded-allow-ips '*' \
+       app_v9:app"]

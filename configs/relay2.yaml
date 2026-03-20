@@ -1,0 +1,41 @@
+# AEGIS-SILENTIUM Relay 2 Configuration
+# Profile: google-analytics-ga4
+# ─────────────────────────────────────
+
+listen:
+  addr: "0.0.0.0:443"
+  cert_file: /certs/relays/relay2_cert.pem
+  key_file:  /certs/relays/relay2_key.pem
+  ca_file:   /certs/ca/ca_cert.pem
+
+core:
+  url:         https://10.99.0.1:5000
+  ca_cert:     /certs/ca/ca_cert.pem
+  client_cert: /certs/clients/relay2_client_cert.pem
+  client_key:  /certs/clients/relay2_client_key.pem
+  timeout:     30s
+
+crypto:
+  signing_key_file: /certs/relays/relay_signing_key.pem
+  revocation_file:  /config/revoked_nodes.json
+  max_session_age:  300
+
+profile:
+  file:         /profiles/google-analytics.yaml
+  fallback_raw: false
+
+security:
+  rate_limit:     100
+  max_body_bytes: 1048576
+  kill_switch_file: /tmp/aegis_kill
+
+logging:
+  level: info
+  file:  /var/log/aegis/relay2.log
+  json:  true
+
+mesh:
+  peer_relays:
+    - https://10.99.0.2:443
+    - https://10.99.0.4:443
+  shared_key: CHANGE_THIS_MESH_SHARED_KEY
