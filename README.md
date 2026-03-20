@@ -1,6 +1,5 @@
 # AEGIS-SILENTIUM v12
 
-**Professional-grade distributed C2 framework with legendary UX. Fully engineered.**
 
 ---
 
@@ -25,7 +24,7 @@
 
 ## What's New in v12
 
-### Legendary Dashboard Overhaul
+### Dashboard Overhaul
 Complete ground-up redesign of the dashboard — 1600+ lines of polished HTML/CSS/JS:
 
 - **Design System** — CSS custom properties, Inter + JetBrains Mono fonts, micro-animations, glass morphism panels, noise texture, radial glow effects
@@ -135,4 +134,4 @@ pytest tests/unit/ --cov=c2 --cov-report=html
 
 ---
 
-*AEGIS-SILENTIUM v12 — Legendary UX. Professional engineering. Operationally ready.*
+
