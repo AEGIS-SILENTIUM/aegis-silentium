@@ -1,6 +1,6 @@
 # AEGIS-SILENTIUM v12 Changelog
 
-## v12.0.0 — Legendary UX Release
+## v12.0.0 — UX Release
 
 ### Dashboard — Complete Ground-Up Redesign
 
